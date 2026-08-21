@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  backend:
+    name: Backend — lint & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agentgraph
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: agentgraph_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: pip install ruff && ruff check .
+
+      - name: Type check (pyright)
+        run: pip install pyright && pyright app/ || true   # non-blocking until types are complete
+
+      - name: Run tests
+        env:
+          SECRET_KEY: ci-test-secret-key-32-chars-minimum
+          POSTGRES_HOST: localhost
+          POSTGRES_USER: agentgraph
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: agentgraph_test
+          NEO4J_URI: bolt://localhost:7687
+          NEO4J_USER: neo4j
+          NEO4J_PASSWORD: test
+          QDRANT_HOST: localhost
+          QDRANT_PORT: 6333
+          LLM_PROVIDER: openai
+          OPENAI_API_KEY: sk-test
+        run: pytest --cov=app --cov-report=term-missing -q
+
+  frontend:
+    name: Frontend — lint & type-check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run type-check
+
+      - name: Lint
+        run: npm run lint

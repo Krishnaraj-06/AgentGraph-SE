@@ -1,10 +1,11 @@
 "use client";
 
 import { useState, useEffect, use } from "react";
+import Link from "next/link";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   FolderKanban, Plus, Github, RefreshCw, GitCommit,
-  GitPullRequest, CheckCircle2, Clock, ChevronDown, X,
+  GitPullRequest, CheckCircle2, Clock, ChevronDown, X, Network,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -14,6 +15,7 @@ import { Alert } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { projectsApi } from "@/lib/projects-api";
 import { githubApi, type GitHubRepo, type SyncStatus } from "@/lib/github-api";
+import { graphApi } from "@/lib/graph-api";
 import { formatRelativeTime } from "@/lib/utils";
 import type { Project } from "@/types";
 
@@ -34,6 +36,8 @@ export default function ProjectsPage({ params }: Props) {
   const [syncStatuses, setSyncStatuses] = useState<Record<string, SyncStatus>>({});
   const [syncing, setSyncing] = useState<string | null>(null);
   const [syncResult, setSyncResult] = useState<{ id: string; msg: string } | null>(null);
+  const [buildingGraph, setBuildingGraph] = useState<string | null>(null);
+  const [graphResult, setGraphResult] = useState<{ id: string; msg: string } | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -72,7 +76,21 @@ export default function ProjectsPage({ params }: Props) {
   };
 
   const handleLinkRepo = async (projectId: string, repoFullName: string) => {
-    await githubApi.linkRepo(workspace, projectId, repoFullName);
+    // Clean the repo name - handle both "owner/repo" and full GitHub URLs
+    let cleanedRepo = repoFullName.trim();
+    
+    // If it's a full GitHub URL, extract owner/repo
+    if (cleanedRepo.includes("github.com/")) {
+      const match = cleanedRepo.match(/github\.com\/([^\/]+\/[^\/\?#]+)/);
+      if (match) {
+        cleanedRepo = match[1];
+      }
+    }
+    
+    // Remove trailing .git if present
+    cleanedRepo = cleanedRepo.replace(/\.git$/, "");
+    
+    await githubApi.linkRepo(workspace, projectId, cleanedRepo);
     const updated = await projectsApi.list(workspace);
     setProjects(updated);
   };
@@ -98,6 +116,24 @@ export default function ProjectsPage({ params }: Props) {
       setSyncResult({ id: projectId, msg: typeof msg === "string" ? msg : "Sync failed." });
     } finally {
       setSyncing(null);
+    }
+  };
+
+  const handleBuildGraph = async (projectId: string) => {
+    setBuildingGraph(projectId);
+    setGraphResult(null);
+    try {
+      const result = await graphApi.buildGraph(workspace, projectId);
+      const s = result.stats;
+      setGraphResult({
+        id: projectId,
+        msg: `✓ Graph built — ${s.developers} developers, ${s.commits} commits, ${s.files} files, ${s.relationships} relationships`,
+      });
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setGraphResult({ id: projectId, msg: typeof msg === "string" ? msg : "Graph build failed." });
+    } finally {
+      setBuildingGraph(null);
     }
   };
 
@@ -191,7 +227,10 @@ export default function ProjectsPage({ params }: Props) {
               syncStatus={syncStatuses[project.id]}
               syncing={syncing === project.id}
               syncResult={syncResult?.id === project.id ? syncResult.msg : null}
+              buildingGraph={buildingGraph === project.id}
+              graphResult={graphResult?.id === project.id ? graphResult.msg : null}
               onSync={() => handleSync(project.id)}
+              onBuildGraph={() => handleBuildGraph(project.id)}
               onLinkRepo={(repo) => handleLinkRepo(project.id, repo)}
             />
           ))}
@@ -210,13 +249,16 @@ interface ProjectCardProps {
   syncStatus: SyncStatus | undefined;
   syncing: boolean;
   syncResult: string | null;
+  buildingGraph: boolean;
+  graphResult: string | null;
   onSync: () => void;
+  onBuildGraph: () => void;
   onLinkRepo: (repo: string) => void;
 }
 
 function ProjectCard({
   project, workspaceSlug, ghConnected, syncStatus,
-  syncing, syncResult, onSync, onLinkRepo,
+  syncing, syncResult, buildingGraph, graphResult, onSync, onBuildGraph, onLinkRepo,
 }: ProjectCardProps) {
   const [showRepoSelect, setShowRepoSelect] = useState(false);
   const [repos, setRepos] = useState<GitHubRepo[]>([]);
@@ -283,6 +325,20 @@ function ProjectCard({
           </Alert>
         )}
 
+        {/* Graph build result message */}
+        {graphResult && (
+          <div className="space-y-2">
+            <Alert variant={graphResult.includes("failed") ? "error" : "success"}>
+              {graphResult}
+            </Alert>
+            {graphResult.startsWith("✓ Graph built") && (
+              <Button asChild variant="outline" size="sm">
+                <Link href={`/${workspaceSlug}/graph?project=${project.id}`}>View Graph</Link>
+              </Button>
+            )}
+          </div>
+        )}
+
         {/* Link repo input */}
         <AnimatePresence>
           {showRepoSelect && !project.github_repo_full_name && (
@@ -293,7 +349,7 @@ function ProjectCard({
               className="flex gap-2"
             >
               <Input
-                placeholder="owner/repository (e.g. octocat/hello-world)"
+                placeholder="owner/repo or https://github.com/owner/repo"
                 value={repoSearch}
                 onChange={(e) => setRepoSearch(e.target.value)}
                 className="font-mono text-xs"
@@ -326,16 +382,30 @@ function ProjectCard({
             </Button>
           )}
           {project.github_repo_full_name && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-2"
-              onClick={onSync}
-              disabled={syncing}
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />
-              {syncing ? "Syncing..." : syncStatus?.synced_at ? "Re-sync" : "Sync Now"}
-            </Button>
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-2 flex-1"
+                onClick={onSync}
+                disabled={syncing}
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${syncing ? "animate-spin" : ""}`} />
+                {syncing ? "Syncing..." : syncStatus?.synced_at ? "Re-sync" : "Sync Now"}
+              </Button>
+              {syncStatus && syncStatus.commit_count > 0 && (
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="gap-2 flex-1"
+                  onClick={onBuildGraph}
+                  disabled={buildingGraph}
+                >
+                  <Network className={`h-3.5 w-3.5 ${buildingGraph ? "animate-pulse" : ""}`} />
+                  {buildingGraph ? "Building..." : "Build Graph"}
+                </Button>
+              )}
+            </>
           )}
         </div>
       </CardContent>

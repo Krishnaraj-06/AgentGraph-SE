@@ -126,9 +126,22 @@ async def link_repo(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    project.github_repo_full_name = body.repo_full_name.strip()
+    # Clean repo name - handle both "owner/repo" and full GitHub URLs
+    repo_name = body.repo_full_name.strip()
+    
+    # If it's a full GitHub URL, extract owner/repo
+    if "github.com/" in repo_name:
+        import re
+        match = re.search(r"github\.com/([^/]+/[^/\?#]+)", repo_name)
+        if match:
+            repo_name = match.group(1)
+    
+    # Remove trailing .git if present
+    repo_name = repo_name.rstrip("/").removesuffix(".git")
+
+    project.github_repo_full_name = repo_name
     await db.flush()
-    return {"project_id": project.id, "repo_full_name": body.repo_full_name}
+    return {"project_id": project.id, "repo_full_name": repo_name}
 
 
 @router.post("/sync/{project_id}", response_model=SyncTriggerResponse)

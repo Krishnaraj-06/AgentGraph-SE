@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
@@ -20,6 +21,29 @@ def _parse_dt(val: str | None) -> datetime | None:
 class GitHubIngestionService:
     def __init__(self, db: AsyncSession):
         self._db = db
+
+    async def _get_commit_details(
+        self,
+        client: GitHubClient,
+        repo_full_name: str,
+        commits: list[dict],
+    ) -> list[dict]:
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch(sha: str) -> dict:
+            async with semaphore:
+                try:
+                    return await client.get_commit_detail(repo_full_name, sha)
+                except Exception:
+                    logger.warning(
+                        "Could not fetch details for commit %s in %s",
+                        sha,
+                        repo_full_name,
+                        exc_info=True,
+                    )
+                    return {}
+
+        return await asyncio.gather(*(fetch(commit["sha"]) for commit in commits))
 
     async def ingest(self, project: Project, token: str) -> dict:
         """
@@ -46,23 +70,37 @@ class GitHubIngestionService:
                 )
                 existing_shas = {r[0] for r in result.fetchall()}
 
+            new_commits = []
             for rc in raw_commits:
                 sha = rc["sha"]
                 if sha in existing_shas:
                     summary["skipped_commits"] += 1
                     continue
+                existing_shas.add(sha)
+                new_commits.append(rc)
 
-                # Fetch detail for file stats (only for recent commits to avoid rate limits)
-                additions, deletions, changed_files = 0, 0, []
-                if summary["commits"] < 100:
-                    try:
-                        detail = await client.get_commit_detail(repo_full_name, sha)
-                        additions = detail.get("stats", {}).get("additions", 0)
-                        deletions = detail.get("stats", {}).get("deletions", 0)
-                        changed_files = [f["filename"] for f in detail.get("files", [])]
-                    except Exception:
-                        pass
+            # Fetch details concurrently for recent commits to keep large syncs responsive.
+            detailed_commits = new_commits[:100]
+            details = await self._get_commit_details(
+                client,
+                repo_full_name,
+                detailed_commits,
+            )
+            details_by_sha = {
+                commit["sha"]: detail
+                for commit, detail in zip(detailed_commits, details)
+            }
 
+            for rc in new_commits:
+                sha = rc["sha"]
+                detail = details_by_sha.get(sha, {})
+                additions = detail.get("stats", {}).get("additions", 0)
+                deletions = detail.get("stats", {}).get("deletions", 0)
+                changed_files = [
+                    file["filename"]
+                    for file in detail.get("files", [])
+                    if file.get("filename")
+                ]
                 commit_data = rc.get("commit", {})
                 author = commit_data.get("author", {})
                 commit = Commit(

@@ -52,7 +52,11 @@ export const githubApi = {
   },
 
   triggerSync: async (workspaceSlug: string, projectId: string): Promise<SyncResult> => {
-    const res = await api.post(`/api/v1/workspaces/${workspaceSlug}/github/sync/${projectId}`);
+    const res = await api.post(
+      `/api/v1/workspaces/${workspaceSlug}/github/sync/${projectId}`,
+      undefined,
+      { timeout: 180_000 }
+    );
     return res.data;
   },
 

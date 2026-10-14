@@ -9,6 +9,7 @@ export interface OverviewStats {
   synced_projects: number;
   top_contributors: { name: string; commits: number }[];
   recent_commits: {
+    id: string;
     sha: string;
     message: string;
     author: string;

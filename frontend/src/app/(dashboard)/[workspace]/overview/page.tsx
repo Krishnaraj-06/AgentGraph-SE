@@ -123,7 +123,7 @@ export default function OverviewPage({ params }: Props) {
               ) : (
                 data.recent_commits.map((c, i) => (
                   <motion.div
-                    key={c.sha}
+                    key={c.id}
                     initial={{ opacity: 0, x: -8 }}
                     animate={{ opacity: 1, x: 0 }}
                     transition={{ delay: i * 0.04 }}

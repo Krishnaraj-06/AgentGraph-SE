@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.sql import text
 
 from app.db.postgres import get_db
 from app.models.workspace import User, Integration
@@ -152,6 +153,12 @@ async def trigger_sync(
     member_info: tuple = Depends(get_workspace_member),
 ):
     """Trigger GitHub data ingestion for a project."""
+    # Prevent overlapping syncs from inserting the same commits and PRs.
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:project_id, 0))"),
+        {"project_id": project_id},
+    )
+
     workspace, _ = member_info
 
     # Get project
@@ -159,7 +166,7 @@ async def trigger_sync(
         select(Project).where(
             Project.id == project_id,
             Project.workspace_id == workspace.id,
-        )
+        ).execution_options(populate_existing=True)
     )
     project = result.scalar_one_or_none()
     if not project:

@@ -78,14 +78,29 @@ async def get_overview(
     ]
 
     # Recent commits
+    ranked_commits = (
+        select(
+            Commit.id.label("id"),
+            func.row_number()
+            .over(
+                partition_by=(Commit.project_id, Commit.sha),
+                order_by=(Commit.committed_at.desc(), Commit.id.desc()),
+            )
+            .label("row_number"),
+        )
+        .where(Commit.project_id.in_(project_ids))
+        .subquery()
+    )
     recent_result = await db.execute(
         select(Commit)
-        .where(Commit.project_id.in_(project_ids))
-        .order_by(Commit.committed_at.desc())
+        .join(ranked_commits, Commit.id == ranked_commits.c.id)
+        .where(ranked_commits.c.row_number == 1)
+        .order_by(Commit.committed_at.desc(), Commit.id.desc())
         .limit(8)
     )
     recent_commits = [
         {
+            "id": str(c.id),
             "sha": c.sha[:7],
             "message": c.message.split("\n")[0][:80],
             "author": c.author_name,

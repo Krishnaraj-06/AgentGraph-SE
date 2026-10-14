@@ -40,14 +40,30 @@ export default function ProjectsPage({ params }: Props) {
   const [graphResult, setGraphResult] = useState<{ id: string; msg: string } | null>(null);
 
   useEffect(() => {
+    let active = true;
     Promise.all([
       projectsApi.list(workspace),
       githubApi.status(workspace),
     ]).then(([projs, ghStatus]) => {
+      if (!active) return;
       setProjects(projs);
       setGhConnected(ghStatus.connected);
-      setLoading(false);
+    }).catch((err: unknown) => {
+      if (!active) return;
+      const detail = (err as { response?: { data?: { detail?: string } } })
+        ?.response?.data?.detail;
+      setError(
+        typeof detail === "string"
+          ? detail
+          : "Could not load this workspace's projects. Please refresh and try again."
+      );
+    }).finally(() => {
+      if (active) setLoading(false);
     });
+
+    return () => {
+      active = false;
+    };
   }, [workspace]);
 
   // Load sync statuses for all projects
@@ -113,7 +129,15 @@ export default function ProjectsPage({ params }: Props) {
       setSyncStatuses((prev) => ({ ...prev, [projectId]: status }));
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setSyncResult({ id: projectId, msg: typeof msg === "string" ? msg : "Sync failed." });
+      const timeout = (err as { code?: string })?.code === "ECONNABORTED";
+      setSyncResult({
+        id: projectId,
+        msg: typeof msg === "string"
+          ? msg
+          : timeout
+            ? "Sync is taking longer than expected. Check the sync status before retrying."
+            : "Sync failed. Please try again.",
+      });
     } finally {
       setSyncing(null);
     }
@@ -131,7 +155,15 @@ export default function ProjectsPage({ params }: Props) {
       });
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setGraphResult({ id: projectId, msg: typeof msg === "string" ? msg : "Graph build failed." });
+      const timeout = (err as { code?: string })?.code === "ECONNABORTED";
+      setGraphResult({
+        id: projectId,
+        msg: typeof msg === "string"
+          ? msg
+          : timeout
+            ? "Graph build is taking longer than expected. Wait before retrying."
+            : "Graph build failed.",
+      });
     } finally {
       setBuildingGraph(null);
     }
@@ -151,6 +183,8 @@ export default function ProjectsPage({ params }: Props) {
           New Project
         </Button>
       </div>
+
+      {error && !showCreate && <Alert variant="error">{error}</Alert>}
 
       {/* Create project form */}
       <AnimatePresence>

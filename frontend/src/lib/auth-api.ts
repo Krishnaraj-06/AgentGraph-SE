@@ -11,8 +11,12 @@ export const authApi = {
   login: async (data: { email: string; password: string }): Promise<TokenResponse> => {
     const res = await api.post<TokenResponse>("/api/v1/auth/login", data);
     const { access_token, refresh_token } = res.data;
-    Cookies.set("access_token", access_token, { secure: true, sameSite: "strict" });
-    Cookies.set("refresh_token", refresh_token, { secure: true, sameSite: "strict" });
+    const cookieOptions = {
+      secure: window.location.protocol === "https:",
+      sameSite: "strict" as const,
+    };
+    Cookies.set("access_token", access_token, cookieOptions);
+    Cookies.set("refresh_token", refresh_token, cookieOptions);
     return res.data;
   },
 

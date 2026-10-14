@@ -1,5 +1,6 @@
 import { Sidebar } from "@/components/layout/sidebar";
 import { Header } from "@/components/layout/header";
+import { WorkspaceAccessGuard } from "@/components/layout/workspace-access-guard";
 
 interface DashboardLayoutProps {
   children: React.ReactNode;
@@ -14,7 +15,11 @@ export default async function DashboardLayout({ children, params }: DashboardLay
       <Sidebar workspaceSlug={workspace} />
       <div className="flex flex-1 flex-col overflow-hidden">
         <Header title="AgentGraph-SE" />
-        <main className="flex-1 overflow-y-auto p-6">{children}</main>
+        <main className="flex-1 overflow-y-auto p-6">
+          <WorkspaceAccessGuard workspaceSlug={workspace}>
+            {children}
+          </WorkspaceAccessGuard>
+        </main>
       </div>
     </div>
   );

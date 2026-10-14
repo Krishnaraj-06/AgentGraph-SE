@@ -15,6 +15,8 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+GRAPH_WRITE_BATCH_SIZE = 500
+
 
 class GraphConstructionService:
     """Builds and updates the Neo4j knowledge graph from relational data."""
@@ -119,125 +121,290 @@ class GraphConstructionService:
         await self._create_project_node(project)
         stats["projects"] = 1
         
-        # 2. Load and process commits
+        # 2. Load and process commits in bounded Neo4j writes.
         commits_result = await self._db.execute(
             select(Commit).where(Commit.project_id == project_id)
         )
         commits = commits_result.scalars().all()
-        
+
         developers_seen = set()
         files_seen = set()
-        
-        for commit in commits:
-            # Create commit node
-            await self._create_commit_node(commit)
-            stats["commits"] += 1
-            
-            # Create developer node (if new)
-            dev_key = commit.author_email
-            if dev_key not in developers_seen:
-                await self._create_developer_node(
-                    email=commit.author_email,
-                    name=commit.author_name,
+        project_id_str = str(project.id)
+        for offset in range(0, len(commits), GRAPH_WRITE_BATCH_SIZE):
+            commit_batch = commits[offset:offset + GRAPH_WRITE_BATCH_SIZE]
+            commit_nodes = []
+            developer_nodes = {}
+            file_nodes = {}
+            authored_edges = []
+            project_edges = []
+            file_edges = []
+
+            for commit in commit_batch:
+                commit_nodes.append(
+                    {
+                        "sha": commit.sha,
+                        "message": commit.message[:500],
+                        "committed_at": commit.committed_at.isoformat(),
+                        "additions": commit.additions,
+                        "deletions": commit.deletions,
+                        "project_id": project_id_str,
+                    }
                 )
-                developers_seen.add(dev_key)
-                stats["developers"] += 1
-            
-            # Link developer -> commit
-            await self._link_developer_authored_commit(
-                email=commit.author_email,
-                sha=commit.sha,
-                timestamp=commit.committed_at,
-            )
-            stats["relationships"] += 1
-            
-            # Link commit -> project
-            await self._link_commit_to_project(commit.sha, str(project.id))
-            stats["relationships"] += 1
-            
-            # Process changed files
-            if commit.changed_files:
+                authored_edges.append(
+                    {
+                        "email": commit.author_email,
+                        "sha": commit.sha,
+                        "timestamp": commit.committed_at.isoformat(),
+                    }
+                )
+                project_edges.append({"sha": commit.sha, "project_id": project_id_str})
+                stats["commits"] += 1
+                stats["relationships"] += 2
+
+                if commit.author_email not in developers_seen:
+                    developers_seen.add(commit.author_email)
+                    developer_nodes[commit.author_email] = {
+                        "email": commit.author_email,
+                        "name": commit.author_name,
+                    }
+                    stats["developers"] += 1
+
+                if not commit.changed_files:
+                    continue
                 try:
                     file_paths = json.loads(commit.changed_files)
-                    for path in file_paths:
-                        file_key = (path, str(project.id))
-                        if file_key not in files_seen:
-                            await self._create_file_node(path, str(project.id))
-                            files_seen.add(file_key)
-                            stats["files"] += 1
-                        
-                        # Link commit -> file
-                        await self._link_commit_modified_file(
-                            sha=commit.sha,
-                            path=path,
-                            project_id=str(project.id),
-                        )
-                        stats["relationships"] += 1
                 except json.JSONDecodeError:
-                    pass
-        
-        # 3. Load and process pull requests
+                    continue
+                if not isinstance(file_paths, list):
+                    continue
+
+                for path in file_paths:
+                    if not isinstance(path, str):
+                        continue
+                    file_key = (path, project_id_str)
+                    if file_key not in files_seen:
+                        files_seen.add(file_key)
+                        file_nodes[file_key] = {
+                            "path": path,
+                            "project_id": project_id_str,
+                        }
+                        stats["files"] += 1
+                    file_edges.append(
+                        {
+                            "sha": commit.sha,
+                            "path": path,
+                            "project_id": project_id_str,
+                        }
+                    )
+                    stats["relationships"] += 1
+
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MERGE (c:Commit {sha: row.sha})
+                SET c.message = row.message,
+                    c.committed_at = datetime(row.committed_at),
+                    c.additions = row.additions,
+                    c.deletions = row.deletions,
+                    c.project_id = row.project_id,
+                    c.updated_at = datetime()
+                """,
+                commit_nodes,
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MERGE (d:Developer {email: row.email})
+                SET d.name = row.name, d.updated_at = datetime()
+                """,
+                list(developer_nodes.values()),
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MERGE (f:File {path: row.path, project_id: row.project_id})
+                SET f.updated_at = datetime()
+                """,
+                list(file_nodes.values()),
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MATCH (d:Developer {email: row.email})
+                MATCH (c:Commit {sha: row.sha})
+                MERGE (d)-[:AUTHORED {timestamp: datetime(row.timestamp)}]->(c)
+                """,
+                authored_edges,
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MATCH (c:Commit {sha: row.sha})
+                MATCH (p:Project {id: row.project_id})
+                MERGE (c)-[:BELONGS_TO]->(p)
+                """,
+                project_edges,
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MATCH (c:Commit {sha: row.sha})
+                MATCH (f:File {path: row.path, project_id: row.project_id})
+                MERGE (c)-[:MODIFIED]->(f)
+                """,
+                file_edges,
+            )
+
+        # 3. Load and process pull requests in bounded Neo4j writes.
         prs_result = await self._db.execute(
             select(PullRequest).where(PullRequest.project_id == project_id)
         )
         prs = prs_result.scalars().all()
-        
+
         branches_seen = set()
-        
-        for pr in prs:
-            # Create PR node
-            await self._create_pull_request_node(pr)
-            stats["pull_requests"] += 1
-            
-            # Create author developer node (if new)
-            # Note: PR author is GitHub username, not email — we'll use a synthetic email
-            author_email = f"{pr.author}@github.local"
-            if author_email not in developers_seen:
-                await self._create_developer_node(
-                    email=author_email,
-                    name=pr.author,
+        for offset in range(0, len(prs), GRAPH_WRITE_BATCH_SIZE):
+            pr_batch = prs[offset:offset + GRAPH_WRITE_BATCH_SIZE]
+            pr_nodes = []
+            pr_developers = {}
+            branch_nodes = {}
+            created_pr_edges = []
+            project_pr_edges = []
+            branch_edges = []
+
+            for pr in pr_batch:
+                pr_nodes.append(
+                    {
+                        "number": pr.number,
+                        "project_id": project_id_str,
+                        "title": pr.title,
+                        "state": pr.state,
+                        "created_at": pr.created_at.isoformat(),
+                        "merged_at": pr.merged_at.isoformat() if pr.merged_at else None,
+                    }
                 )
-                developers_seen.add(author_email)
-                stats["developers"] += 1
-            
-            # Link developer -> PR
-            await self._link_developer_created_pr(
-                author_email=author_email,
-                pr_number=pr.number,
-                project_id=str(project.id),
-                timestamp=pr.created_at,
+                author_email = f"{pr.author}@github.local"
+                if author_email not in developers_seen:
+                    developers_seen.add(author_email)
+                    pr_developers[author_email] = {
+                        "email": author_email,
+                        "name": pr.author,
+                    }
+                    stats["developers"] += 1
+
+                created_pr_edges.append(
+                    {
+                        "author_email": author_email,
+                        "number": pr.number,
+                        "project_id": project_id_str,
+                        "timestamp": pr.created_at.isoformat(),
+                    }
+                )
+                project_pr_edges.append(
+                    {"number": pr.number, "project_id": project_id_str}
+                )
+                stats["pull_requests"] += 1
+                stats["relationships"] += 2
+
+                for branch_name in [pr.base_branch, pr.head_branch]:
+                    if branch_name:
+                        branch_key = (branch_name, project_id_str)
+                        if branch_key not in branches_seen:
+                            branches_seen.add(branch_key)
+                            branch_nodes[branch_key] = {
+                                "name": branch_name,
+                                "project_id": project_id_str,
+                            }
+                            stats["branches"] += 1
+
+                if pr.base_branch and pr.head_branch:
+                    branch_edges.append(
+                        {
+                            "number": pr.number,
+                            "project_id": project_id_str,
+                            "base_branch": pr.base_branch,
+                            "head_branch": pr.head_branch,
+                        }
+                    )
+                    stats["relationships"] += 2
+
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MERGE (pr:PullRequest {number: row.number, project_id: row.project_id})
+                SET pr.title = row.title,
+                    pr.state = row.state,
+                    pr.created_at = datetime(row.created_at),
+                    pr.merged_at = CASE
+                        WHEN row.merged_at IS NOT NULL THEN datetime(row.merged_at)
+                        ELSE null
+                    END,
+                    pr.updated_at = datetime()
+                """,
+                pr_nodes,
             )
-            stats["relationships"] += 1
-            
-            # Link PR -> project
-            await self._link_pr_to_project(pr.number, str(project.id))
-            stats["relationships"] += 1
-            
-            # Create branch nodes
-            for branch_name in [pr.base_branch, pr.head_branch]:
-                if branch_name:
-                    branch_key = (branch_name, str(project.id))
-                    if branch_key not in branches_seen:
-                        await self._create_branch_node(branch_name, str(project.id))
-                        branches_seen.add(branch_key)
-                        stats["branches"] += 1
-            
-            # Link PR -> branches
-            if pr.base_branch and pr.head_branch:
-                await self._link_pr_to_branches(
-                    pr_number=pr.number,
-                    project_id=str(project.id),
-                    base_branch=pr.base_branch,
-                    head_branch=pr.head_branch,
-                )
-                stats["relationships"] += 2  # two edges
-        
-        # 4. Create collaboration edges between developers who worked on same files
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MERGE (d:Developer {email: row.email})
+                SET d.name = row.name, d.updated_at = datetime()
+                """,
+                list(pr_developers.values()),
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MERGE (b:Branch {name: row.name, project_id: row.project_id})
+                SET b.updated_at = datetime()
+                """,
+                list(branch_nodes.values()),
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MATCH (d:Developer {email: row.author_email})
+                MATCH (pr:PullRequest {number: row.number, project_id: row.project_id})
+                MERGE (d)-[:CREATED_PR {timestamp: datetime(row.timestamp)}]->(pr)
+                """,
+                created_pr_edges,
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MATCH (pr:PullRequest {number: row.number, project_id: row.project_id})
+                MATCH (p:Project {id: row.project_id})
+                MERGE (pr)-[:BELONGS_TO]->(p)
+                """,
+                project_pr_edges,
+            )
+            await self._run_batched(
+                """
+                UNWIND $rows AS row
+                MATCH (pr:PullRequest {number: row.number, project_id: row.project_id})
+                MATCH (base:Branch {name: row.base_branch, project_id: row.project_id})
+                MATCH (head:Branch {name: row.head_branch, project_id: row.project_id})
+                MERGE (pr)-[:TARGETS_BRANCH]->(base)
+                MERGE (pr)-[:FROM_BRANCH]->(head)
+                """,
+                branch_edges,
+            )
+
+        # 4. Create collaboration edges between developers who worked on same files.
         await self._create_collaboration_edges(commits, str(project.id))
         stats["relationships"] += 1  # approximate — actual count varies
         
         logger.info("Graph construction complete for project %s: %s", project_id, stats)
         return stats
+
+    async def _run_batched(
+        self,
+        cypher: str,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        for offset in range(0, len(rows), GRAPH_WRITE_BATCH_SIZE):
+            await run_query(
+                cypher,
+                {"rows": rows[offset:offset + GRAPH_WRITE_BATCH_SIZE]},
+            )
     
     async def _create_project_node(self, project: Project):
         await run_query(
@@ -372,15 +539,27 @@ class GraphConstructionService:
                     pair = tuple(sorted([dev1, dev2]))
                     collaborations.add(pair)
         
-        for dev1_email, dev2_email in collaborations:
-            await run_query(
-                CYPHER_TEMPLATES["create_collaboration_edge"],
-                {
-                    "dev1_email": dev1_email,
-                    "dev2_email": dev2_email,
-                    "timestamp": datetime.now().isoformat(),
-                },
-            )
+        collaboration_rows = [
+            {
+                "dev1_email": dev1_email,
+                "dev2_email": dev2_email,
+                "timestamp": datetime.now().isoformat(),
+            }
+            for dev1_email, dev2_email in collaborations
+        ]
+        await self._run_batched(
+            """
+            UNWIND $rows AS row
+            MATCH (d1:Developer {email: row.dev1_email})
+            MATCH (d2:Developer {email: row.dev2_email})
+            WHERE d1 <> d2
+            MERGE (d1)-[w:WORKED_WITH]-(d2)
+            ON CREATE SET w.count = 1, w.first_interaction = datetime(row.timestamp)
+            ON MATCH SET w.count = w.count + 1,
+                         w.last_interaction = datetime(row.timestamp)
+            """,
+            collaboration_rows,
+        )
     
     async def delete_project_graph(self, project_id: str):
         """

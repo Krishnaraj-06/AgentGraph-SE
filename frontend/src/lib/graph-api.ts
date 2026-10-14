@@ -41,8 +41,10 @@ export const graphApi = {
   },
 
   async buildGraph(workspaceSlug: string, projectId: string): Promise<GraphBuildResponse> {
-    const { data } = await api.post(
-      `/api/v1/workspaces/${workspaceSlug}/graph/build/${projectId}`
+    const { data } = await api.post<GraphBuildResponse>(
+      `/api/v1/workspaces/${workspaceSlug}/graph/build/${projectId}`,
+      undefined,
+      { timeout: 180_000 }
     );
     return data;
   },
